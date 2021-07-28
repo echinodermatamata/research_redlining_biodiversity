@@ -1,0 +1,673 @@
+---
+title: "Appendix 5"
+author: "Callaghan et al."
+date: "October 12, 2017"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+library(formatR)
+knitr::opts_chunk$set(echo = TRUE, tidy=TRUE)
+```
+
+# R Tutorial to perform analysis on eBird data from an urban greenspace
+
+This document accompanies the Callaghan et al. article titled __Assessing the reliability of avian biodiversity measures of urban greenspaces using eBird citizen science data__ in Avian Conservation and Ecology, and is meant to provide an overview for managers, conservationists, and urban planners who wish to use eBird data at a local site.
+
+## Step 1: Download and prepare data for analysis
+
+eBird data can be downloaded from http://ebird.org/ebird/data/download. 
+
+First, you need to request access. After access has been granted, you should download the appropriate data at the smallest possible spatial scale (i.e., county, state, or country) where the chosen hotspot is located, and then subset to the interested greenspace. This can sometimes be done in Excel, if the dataset is small enough.
+
+For the purposes of this tutorial, we chose to investigate Beuna Vista Park, located in San Francisco, California.
+We have already created a dataset that is only for that site, which is also provided.
+
+### Step 1.1: Load necessary packages for analysis
+```{r message=FALSE, warning=FALSE}
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(vegan)
+library(reshape2)
+library(data.table)
+library(tidyr)
+```
+
+### Step 1.2: Set working directory
+```{r eval=FALSE}
+setwd("~/Desktop/eBird")
+```
+
+
+### Step 1.3: Read eBird data in
+We use the ```read_csv``` function from the ```readr``` package to read in data
+```{r message=FALSE, warning=FALSE}
+BV <- read_csv("BV.csv")
+```
+
+
+### Step 1.4: Massage data and choose best quality data based on our predefined filters
+```{r message=FALSE, warning=FALSE}
+# Format Date
+BV$OBSERVATION_DATE <- as.Date(BV$OBSERVATION_DATE, format="%Y-%m-%d")
+
+# add year to the dataframe
+BV$YEAR <- year(BV$OBSERVATION_DATE)
+
+# add all the columns needed for the analysis (that don't vary within checklist)
+sampling_event_info <- BV %>%
+  select(SAMPLING_EVENT_IDENTIFIER, LOCALITY, LOCALITY_ID, OBSERVATION_DATE,
+         PROTOCOL_TYPE, ALL_SPECIES_REPORTED, EFFORT_DISTANCE_KM, EFFORT_AREA_HA, 
+         DURATION_MINUTES, YEAR, GROUP_IDENTIFIER, LATITUDE, LONGITUDE) %>%
+  distinct()
+
+
+# Counts how many 'x's per checklist
+X_missing <- BV %>%
+  group_by(SAMPLING_EVENT_IDENTIFIER) %>%
+  summarise(number_X = sum(OBSERVATION_COUNT=="X"))
+
+
+# accounts for the instance in which people submit 
+# the same species both at the species and subspecies level
+# also makes it so only 'species' and 'issf' category are included in analysis
+BV_clean <- BV %>%
+  filter(CATEGORY %in% c("species","issf")) %>% 
+  group_by(SAMPLING_EVENT_IDENTIFIER, COMMON_NAME) %>%
+  summarise(COUNT_SPP = sum(as.numeric(as.character(OBSERVATION_COUNT)))) %>%
+  rename(OBSERVATION_COUNT = COUNT_SPP) %>% 
+  inner_join(., sampling_event_info, by="SAMPLING_EVENT_IDENTIFIER")%>%
+  inner_join(., X_missing, by="SAMPLING_EVENT_IDENTIFIER")
+
+##################################################
+##### apply some basic criteria to filter by #####
+##################################################
+
+# apply some filtering criteria
+analysis_data <- BV_clean %>%
+  ## filter for only complete checklists
+  filter(ALL_SPECIES_REPORTED == 1) %>%
+  ## only using stationary, traveling, and exhaustive area type checklists
+  filter(PROTOCOL_TYPE %in% c("eBird - Exhaustive Area Count", "eBird - Stationary Count", "eBird - Traveling Count")) %>%
+  ## Get rid of any checklists that had a single X
+  filter(number_X==0) %>%
+  group_by(SAMPLING_EVENT_IDENTIFIER) %>%
+  summarise(Species_Richness=length(unique(COMMON_NAME)), 
+            Species_Diversity=diversity(OBSERVATION_COUNT), 
+            Species_Abundance=sum(OBSERVATION_COUNT, na.rm=TRUE), 
+            Minutes=mean(DURATION_MINUTES, na.rm=TRUE), 
+            Distance_km=mean(EFFORT_DISTANCE_KM, na.rm=TRUE), 
+            Area_ha=mean(EFFORT_AREA_HA, na.rm=TRUE)) %>%
+  inner_join(BV_clean, ., by="SAMPLING_EVENT_IDENTIFIER") %>%
+  ## Filter between 2010 and 2016
+  filter(YEAR>= 2010 & YEAR <= 2016)
+
+
+##############################################################################
+## filtering out group_identifier data to eliminate 'duplicated' checklists ##
+##############################################################################
+
+# first select the group_identifiers and associated checklists
+duplicated <- analysis_data %>%
+  drop_na(GROUP_IDENTIFIER) %>%
+  select(GROUP_IDENTIFIER, SAMPLING_EVENT_IDENTIFIER) %>%
+  distinct(.keep_all=TRUE) %>%
+  group_by(GROUP_IDENTIFIER) %>%
+  # randomly sample one checklist for each group_identifier
+  sample_n(., 1) %>%
+  .$SAMPLING_EVENT_IDENTIFIER
+
+duplicated_data <- analysis_data %>%
+  filter(SAMPLING_EVENT_IDENTIFIER %in% duplicated)
+
+## now, append the selected checklists for each group_identifier
+## with the non group_identifier checklists from the data
+analysis_data <- analysis_data %>%
+  filter(!grepl("G", GROUP_IDENTIFIER)) %>%
+  bind_rows(., duplicated_data)
+
+
+#########################################################
+############ apply distance and duration caps ###########
+#########################################################
+analysis_data <- analysis_data %>%
+  filter(DURATION_MINUTES >= 5 & DURATION_MINUTES <=240) %>%
+  filter(EFFORT_DISTANCE_KM <= 10)
+
+
+## rename analysis_data to signify it is the 'complete' checklist usage
+analysis_data.all <- analysis_data
+
+
+######################################################################
+#### get rid of species which did not occur on >95% of checklists ####
+######################################################################
+
+## Exlude the species that rarely occur
+checklists_hotspots <- analysis_data.all%>%
+  group_by(LOCALITY_ID)%>%
+  summarise(total_checklists=length(unique(SAMPLING_EVENT_IDENTIFIER)))
+
+## create a dataframe which removes the species that are on <=5% of checklists in a hotspot
+analysis_data.95 <- analysis_data.all%>%
+  group_by(LOCALITY_ID, COMMON_NAME)%>%
+  summarise(species_count=length(COMMON_NAME))%>%
+  inner_join(checklists_hotspots, ., by="LOCALITY_ID")%>%
+  mutate(percentage_of_checklists=(species_count/total_checklists)*100)%>%
+  inner_join(analysis_data.all, ., by=c("LOCALITY_ID", "COMMON_NAME"))%>%
+  filter(percentage_of_checklists >=5.00) ## removing species that are on < 5% of checklists in a hotspot
+
+
+## Clean up workspace
+rm(list=setdiff(ls(), c("analysis_data.all", "analysis_data.95")))
+
+```
+
+We now have two dataframes on which analyses can be performed - __analysis_data.all__ & __analysis_data.95__.
+
+## Step 2: Analysis of data at Buena Vista Park, San Francisco, California
+
+Here, we will perform the analysis for three variables: Species Richness, Community Composition, and Shannon Diversity
+
+### Step 2.1: Species Richness
+
+#### Step 2.1.1: Formatting data for species richness calculations
+```{r}
+# select the necessary columns
+brd_matrix <- analysis_data.all %>%
+  select(COMMON_NAME, OBSERVATION_COUNT, SAMPLING_EVENT_IDENTIFIER) 
+
+# spread the columns to a matrix form
+brd_matrix <- dcast(brd_matrix, SAMPLING_EVENT_IDENTIFIER~COMMON_NAME, fun.aggregate=mean, value.var="OBSERVATION_COUNT") 
+
+# remove NaN and replacing with 0
+brd_matrix <- as.data.frame(lapply(brd_matrix, function(y) gsub("NaN", "0", y)))
+
+# subset the checklists to make row names
+brd_matrix_row.names <- brd_matrix$SAMPLING_EVENT_IDENTIFIER 
+row.names(brd_matrix) <- brd_matrix_row.names
+brd_matrix$SAMPLING_EVENT_IDENTIFIER <- NULL
+
+# make the entire data frame numeric for analysis sake
+asNumeric <- function(x) as.numeric(as.character(x))
+factorsNumeric <- function(d) modifyList(d, lapply(d[, sapply(d, is.factor)], asNumeric))
+brd_matrix <- factorsNumeric(brd_matrix)
+
+
+ttt=apply(brd_matrix,MARGIN = 1:2,FUN = as.numeric)
+which(is.na(ttt[,1]))
+
+str(brd_matrix)
+dput(brd_matrix)
+```
+
+
+#### Step 2.1.2: Calculating species richness curve 
+```{r}
+# specaccum function from vegan
+
+brd_matrix <- brd_matrix[,-1]
+
+#Apply specaccum function
+BV_acc <- specaccum(brd_matrix, method="random", permutations=1000)
+
+###My richness
+rich <- specnumber(brd_matrix, MARGIN = 1)
+
+# make it a dataframe
+BV_acc.data <- data.frame(Checklists=BV_acc$sites, Richness=BV_acc$richness, SD=BV_acc$sd)
+
+BV_acc.data$specpool <- specpool(mat)[,2]
+BV_acc.data$cumpercent.estimated <- 
+  (BV_acc.data$Richness/BV_acc.data$specpool)*100
+
+ggplot(BV_acc.data, aes(x=Checklists, y=Richness))+
+  geom_point() +
+  geom_line() +
+  geom_ribbon(aes(x=Checklists, ymin=(Richness-2*SD),ymax=(Richness+2*SD)),alpha=0.2)
+```
+
+#### Step 2.1.3: Calculate the number of checklists necessary to reach percentage thresholds (70%, 80%, 90%)
+
+```{r}
+# this dataframe represents the minimum number of checklists needed
+# to reach 70% of the estimated species richness at a particular site
+seventy_threshold <- data.frame(BV_acc.data%>%
+                                  filter(cumpercent.estimated >=70)%>%
+                                  slice(which.min(cumpercent.estimated)))[c(1)]
+seventy_threshold$threshold <- '70%'
+
+# same as above, but for 80% threshold
+eighty_threshold <- data.frame(BV_acc.data%>%
+                                 filter(cumpercent.estimated >=80)%>%
+                                 slice(which.min(cumpercent.estimated)))[c(1)]
+eighty_threshold$threshold <- '80%'
+
+# same as above, but for 90% threshold
+ninety_threshold <- data.frame(BV_acc.data%>%
+                                 filter(cumpercent.estimated >=90)%>%
+                                 slice(which.min(cumpercent.estimated)))[c(1)]
+ninety_threshold$threshold <- '90%'
+
+# combine the three dataframes created above
+SPECIES_RICHNESS_THRESHOLDS.all <- rbind(seventy_threshold, eighty_threshold, ninety_threshold)
+
+```
+
+Look at the minimum number of checklists to reach the necessary thresholds
+```{r}
+head(SPECIES_RICHNESS_THRESHOLDS.all)
+```
+
+#### Step 2.1.4 Repeat the analysis, but eliminate the species which occured on <= 5% of checklists
+ 
+This is easily accomplished by substituting the dataframe which is **analysis_data.95** in for the **analysis_data.all** in the first line, above. The code has been excluded here, but the results shown below.
+```{r echo=FALSE}
+# select the necessary columns
+brd_matrix <- analysis_data.95 %>%
+  select(COMMON_NAME, OBSERVATION_COUNT, SAMPLING_EVENT_IDENTIFIER) 
+
+# spread the columns to a matrix form
+brd_matrix <- dcast(brd_matrix, SAMPLING_EVENT_IDENTIFIER~COMMON_NAME, fun.aggregate=mean, value.var="OBSERVATION_COUNT") 
+
+# remove NaN and replacing with 0
+brd_matrix <- as.data.frame(lapply(brd_matrix, function(y) gsub("NaN", "0", y)))
+
+# subset the checklists to make row names
+brd_matrix_row.names <- brd_matrix$SAMPLING_EVENT_IDENTIFIER 
+row.names(brd_matrix) <- brd_matrix_row.names
+brd_matrix$SAMPLING_EVENT_IDENTIFIER <- NULL
+
+
+# make the entire data frame numeric for analysis sake
+asNumeric <- function(x) as.numeric(as.character(x))
+factorsNumeric <- function(d) modifyList(d, lapply(d[, sapply(d, is.factor)], asNumeric))
+brd_matrix <- factorsNumeric(brd_matrix)
+
+# specaccum function from vegan
+BV_acc <- specaccum(brd_matrix, method="random", permutations=1000)
+
+# make it a dataframe
+BV_acc.data <- data.frame(Checklists=BV_acc$sites, Richness=BV_acc$richness, SD=BV_acc$sd)
+
+BV_acc.data$specpool <- specpool(brd_matrix)[,2]
+BV_acc.data$cumpercent.estimated <- 
+  (BV_acc.data$Richness/BV_acc.data$specpool)*100
+
+ggplot(BV_acc.data, aes(x=Checklists, y=Richness))+
+  geom_point() +
+  geom_line() +
+  geom_ribbon(aes(x=Checklists, ymin=(Richness-2*SD),ymax=(Richness+2*SD)),alpha=0.2)
+
+# this dataframe represents the minimum number of checklists needed
+# to reach 70% of the estimated species richness at a particular site
+seventy_threshold <- data.frame(BV_acc.data%>%
+                                  filter(cumpercent.estimated >=70)%>%
+                                  slice(which.min(cumpercent.estimated)))[c(1)]
+seventy_threshold$threshold <- '70%'
+
+# same as above, but for 80% threshold
+eighty_threshold <- data.frame(BV_acc.data%>%
+                                 filter(cumpercent.estimated >=80)%>%
+                                 slice(which.min(cumpercent.estimated)))[c(1)]
+eighty_threshold$threshold <- '80%'
+
+# same as above, but for 90% threshold
+ninety_threshold <- data.frame(BV_acc.data%>%
+                                 filter(cumpercent.estimated >=90)%>%
+                                 slice(which.min(cumpercent.estimated)))[c(1)]
+ninety_threshold$threshold <- '90%'
+
+# combine the three dataframes created above
+SPECIES_RICHNESS_THRESHOLDS.95 <- rbind(seventy_threshold, eighty_threshold, ninety_threshold)
+
+head(SPECIES_RICHNESS_THRESHOLDS.95)
+```
+
+
+
+### Step 2.2: Community Composition (Bray-curtis similarity index)
+
+#### Step 2.2.1: Using the autosimi function, from the CommEcol package
+
+This function has been slightly modified to allow for replacement and to create a standard deviation of the permutations
+
+```{r}
+autosimi <- function(comm, method="bray", binary=FALSE, log.transf=FALSE, 
+                     simi=TRUE, permutations=1000){
+
+n.samp <- nrow(comm)
+spp    <- ncol(comm)
+size   <- n.samp
+sizes  <- 1:size
+
+resu.m <- matrix(NA, size, permutations)
+
+for(i in 1:permutations){
+   for(j in sizes){
+      if(j==1){ pair<-comm[sample(1:n.samp,2), ]}
+      if(j>1) {
+          temp<-comm[sample(1:n.samp, j*2, replace=TRUE), ]
+          temp1<-temp[1:j,]
+          temp2<-temp[(j+1):(j*2),]
+          temp1<-colSums(temp1)
+          temp2<-colSums(temp2)
+          pair<-rbind(temp1,temp2)
+          }
+
+      if(binary==TRUE){pair<-ifelse(pair>0,1,0)}# close if binary
+      if(binary==FALSE & log.transf==TRUE){pair<-log(pair+1)}
+      if(binary==TRUE & log.transf==TRUE){stop("You can not log-transform presence/absence data")}
+      
+      if(simi==TRUE){resu.m[j,i]<-as.numeric(1-vegdist(pair, method, binary))}
+      if(simi==FALSE){resu.m[j,i]<-as.numeric(vegdist(pair, method, binary))}
+   }#close for j
+}# close for i
+
+mean.perm <- rowMeans(resu.m)
+sd.perm <- apply(resu.m,1,sd)
+resu <- data.frame(sizes, mean.perm, sd.perm)
+indexes <- c("manhattan", "euclidean", "canberra",      "bray", "kulczynski", "jaccard", "gower",
+              "altGower",  "morisita",     "horn", "mountford", "raup" , "binomial", "chao")
+colnames(resu) <- c("sample.size", indexes[pmatch(method,indexes)], "sd")
+return(resu)
+}
+```
+
+
+#### Step 2.2.2: Preparing data for analysis
+
+This is done in the same way as above.
+```{r}
+# select the necessary columns
+brd_matrix <- analysis_data.all %>%
+  select(COMMON_NAME, OBSERVATION_COUNT, SAMPLING_EVENT_IDENTIFIER) 
+
+# spread the columns to a matrix form
+brd_matrix <- dcast(brd_matrix, SAMPLING_EVENT_IDENTIFIER~COMMON_NAME, fun.aggregate=mean, value.var="OBSERVATION_COUNT") 
+
+# remove NaN and replacing with 0
+brd_matrix <- as.data.frame(lapply(brd_matrix, function(y) gsub("NaN", "0", y)))
+
+# subset the checklists to make row names
+brd_matrix_row.names <- brd_matrix$SAMPLING_EVENT_IDENTIFIER 
+row.names(brd_matrix) <- brd_matrix_row.names
+brd_matrix$SAMPLING_EVENT_IDENTIFIER <- NULL
+
+
+# make the entire data frame numeric for analysis sake
+asNumeric <- function(x) as.numeric(as.character(x))
+factorsNumeric <- function(d) modifyList(d, lapply(d[, sapply(d, is.factor)], asNumeric))
+brd_matrix <- factorsNumeric(brd_matrix)
+```
+
+#### Step 2.2.3: Using the autosimi function
+
+```{r}
+similarity_BV <- autosimi(brd_matrix)
+
+similarity_BV$total <- tail(similarity_BV$bray, n=1)
+similarity_BV$cumpercent.observed <- 
+  (similarity_BV$bray/similarity_BV$total)*100
+
+# plot it
+ggplot(similarity_BV, aes(x=sample.size, y=bray))+
+    geom_point() +
+    geom_line() +
+    geom_ribbon(aes(x=sample.size, ymin=(bray-2*sd),ymax=(bray+2*sd)),alpha=0.2) +
+    xlab('Checklists')+
+    ylab('Similarity (bray)')
+```
+
+#### Step 2.2.4: Calculating the number of checklists necessary to reach percentage thresholds (70%, 80%, 90%)
+
+```{r}
+# this dataframe represents the minimum number of checklists needed
+# to reach 70% of the estimated species richness at a particular site
+seventy_threshold <- data.frame(similarity_BV%>%
+                                  filter(cumpercent.observed >=70)%>%
+                                  slice(which.min(cumpercent.observed)))[c(1)]
+seventy_threshold$threshold <- '70%'
+
+# same as above, but for 80% threshold
+eighty_threshold <- data.frame(similarity_BV%>%
+                                 filter(cumpercent.observed >=80)%>%
+                                 slice(which.min(cumpercent.observed)))[c(1)]
+eighty_threshold$threshold <- '80%'
+
+# same as above, but for 90% threshold
+ninety_threshold <- data.frame(similarity_BV%>%
+                                 filter(cumpercent.observed >=90)%>%
+                                 slice(which.min(cumpercent.observed)))[c(1)]
+ninety_threshold$threshold <- '90%'
+
+# combine the three dataframes created above
+COMMUNITY_COMPOSITION_THRESHOLDS.all <- rbind(seventy_threshold, eighty_threshold, ninety_threshold)
+```
+
+Look at the minimum number of checklists to reach the necessary thresholds
+```{r}
+head(COMMUNITY_COMPOSITION_THRESHOLDS.all)
+```
+
+#### Step 2.2.5 As above, repeat the analysis, but eliminate the species which occured on <= 5% of checklists
+Again, the code is not shown.
+
+```{r echo=FALSE}
+# select the necessary columns
+brd_matrix <- analysis_data.95 %>%
+  select(COMMON_NAME, OBSERVATION_COUNT, SAMPLING_EVENT_IDENTIFIER) 
+
+# spread the columns to a matrix form
+brd_matrix <- dcast(brd_matrix, SAMPLING_EVENT_IDENTIFIER~COMMON_NAME, fun.aggregate=mean, value.var="OBSERVATION_COUNT") 
+
+# remove NaN and replacing with 0
+brd_matrix <- as.data.frame(lapply(brd_matrix, function(y) gsub("NaN", "0", y)))
+
+# subset the checklists to make row names
+brd_matrix_row.names <- brd_matrix$SAMPLING_EVENT_IDENTIFIER 
+row.names(brd_matrix) <- brd_matrix_row.names
+brd_matrix$SAMPLING_EVENT_IDENTIFIER <- NULL
+
+
+# make the entire data frame numeric for analysis sake
+asNumeric <- function(x) as.numeric(as.character(x))
+factorsNumeric <- function(d) modifyList(d, lapply(d[, sapply(d, is.factor)], asNumeric))
+brd_matrix <- factorsNumeric(brd_matrix)
+ 
+similarity_BV <- autosimi(brd_matrix)
+
+similarity_BV$total <- tail(similarity_BV$bray, n=1)
+similarity_BV$cumpercent.observed <- 
+  (similarity_BV$bray/similarity_BV$total)*100
+
+# plot it
+ggplot(similarity_BV, aes(x=sample.size, y=bray))+
+    geom_point() +
+    geom_line() +
+    geom_ribbon(aes(x=sample.size, ymin=(bray-2*sd),ymax=(bray+2*sd)),alpha=0.2) +
+    xlab('Checklists')+
+    ylab('Similarity (bray)')
+
+# this dataframe represents the minimum number of checklists needed
+# to reach 70% of the estimated species richness at a particular site
+seventy_threshold <- data.frame(similarity_BV%>%
+                                  filter(cumpercent.observed >=70)%>%
+                                  slice(which.min(cumpercent.observed)))[c(1)]
+seventy_threshold$threshold <- '70%'
+
+# same as above, but for 80% threshold
+eighty_threshold <- data.frame(similarity_BV%>%
+                                 filter(cumpercent.observed >=80)%>%
+                                 slice(which.min(cumpercent.observed)))[c(1)]
+eighty_threshold$threshold <- '80%'
+
+# same as above, but for 90% threshold
+ninety_threshold <- data.frame(similarity_BV%>%
+                                 filter(cumpercent.observed >=90)%>%
+                                 slice(which.min(cumpercent.observed)))[c(1)]
+ninety_threshold$threshold <- '90%'
+
+# combine the three dataframes created above
+COMMUNITY_COMPOSITION_THRESHOLDS.95 <- rbind(seventy_threshold, eighty_threshold, ninety_threshold)
+
+head(COMMUNITY_COMPOSITION_THRESHOLDS.95)
+```
+
+
+### Step 2.3: Shannon Diversity
+
+#### Step 2.3.1: This is a function to run a bootstrap on the Shannon Diversity
+
+```{r}
+select_hotspot <- function(hotspot, data) {
+  hotspot_data <- data %>%
+    filter(LOCALITY_ID == hotspot) %>%
+    select(COMMON_NAME, OBSERVATION_COUNT, SAMPLING_EVENT_IDENTIFIER)
+  return(hotspot_data)
+}
+
+calculate_hotspot_diversity <- function(n, hotspot_data, quiet = T) {
+  sampled_hotspots <- sample(unique(as.character(hotspot_data$SAMPLING_EVENT_IDENTIFIER)), 
+                             n, replace = T)
+  sampled_hotspot_diversity <- hotspot_data %>%
+    filter(SAMPLING_EVENT_IDENTIFIER %in% sampled_hotspots) %>%
+    group_by(COMMON_NAME) %>%
+    summarise(mean_count = mean(OBSERVATION_COUNT)) %>%
+    select(mean_count) %>%
+    summarise(diversity = vegan::diversity(mean_count)) %>%
+    mutate(number_checklists = n)
+  if (!quiet) {message(paste0("Boostrap ",n))}
+  return(sampled_hotspot_diversity)
+}
+
+bootstrap_checklist_once <- function(hotspot, data) {
+  hotspot_data <- select_hotspot(hotspot, data)
+  checklist_n <- length(unique(as.character(hotspot_data$SAMPLING_EVENT_IDENTIFIER)))
+  boostrapped_diversity <- lapply(X = 1:checklist_n,
+                                  FUN = calculate_hotspot_diversity,
+                                  hotspot_data)
+  return(rbindlist(boostrapped_diversity))
+}
+
+bootstrap_hotspot_diversity <- function(hotspot, data, nboot = 10, plot = T, quiet =T) {
+  if (!hotspot %in% data$LOCALITY_ID) {stop(paste0(hotspot, " hotspot is not in the data"))}
+  message(paste0("Analysing the ",hotspot," hotspot"))
+  
+  bootstrap_results <- rbindlist(replicate(n = nboot, bootstrap_checklist_once(hotspot, data), simplify = F))
+  
+  if (plot) {
+  bootstrap_summary <- bootstrap_results %>%
+      group_by(number_checklists) %>%
+      summarise(mean = mean(diversity),
+                sd = sd(diversity),
+                cv = sd/mean,
+                upper_95 = quantile(diversity, 0.975),
+                lower_95 = quantile(diversity, 0.025))
+    
+  plt <- ggplot(bootstrap_summary, aes(x=number_checklists)) +
+    geom_point(aes(y=mean)) +
+    geom_line(aes(y=mean)) +
+    geom_ribbon(aes(ymin=(lower_95), ymax=(upper_95)),alpha=0.2) +
+    ggtitle(hotspot) +
+    xlab('Checklists') +
+    ylab('Diversity')
+  print(plt)
+  invisible(bootstrap_summary)
+  } else {
+    return(bootstrap_results)
+  }
+}
+```
+
+
+#### Step 2.3.2: Use the function to calculate the diversity
+
+```{r}
+BV_diversity <- bootstrap_hotspot_diversity('L508074', analysis_data.all, nboot = 1000, plot = T)
+
+BV_diversity$total <- tail(BV_diversity$mean, n=1)
+BV_diversity$cumpercent.observed <- 
+  (BV_diversity$mean/BV_diversity$total)*100
+```
+
+#### Step 2.3.3: Calculate the number of checklists necessary to reach percentage thresholds (70%, 80%, 90%)
+
+```{r}
+# this dataframe represents the minimum number of checklists needed
+# to reach 70% of the estimated species richness at a particular site
+seventy_threshold <- data.frame(BV_diversity%>%
+                                  filter(cumpercent.observed >=70)%>%
+                                  slice(which.min(cumpercent.observed)))[c(1)]
+seventy_threshold$threshold <- '70%'
+
+# same as above, but for 80% threshold
+eighty_threshold <- data.frame(BV_diversity%>%
+                                 filter(cumpercent.observed >=80)%>%
+                                 slice(which.min(cumpercent.observed)))[c(1)]
+eighty_threshold$threshold <- '80%'
+
+# same as above, but for 90% threshold
+ninety_threshold <- data.frame(BV_diversity%>%
+                                 filter(cumpercent.observed >=90)%>%
+                                 slice(which.min(cumpercent.observed)))[c(1)]
+ninety_threshold$threshold <- '90%'
+
+# combine the three dataframes created above
+SPECIES_DIVERSITY_THRESHOLDS.all <- rbind(seventy_threshold, eighty_threshold, ninety_threshold)
+```
+
+Look at the minimum number of checklists to reach the necessary thresholds
+```{r}
+head(SPECIES_DIVERSITY_THRESHOLDS.all)
+```
+
+
+#### Step 2.3.4 Repeat the analysis, but eliminate the species which occured on <= 5% of checklists
+Again, the code is not shown.
+
+```{r echo=FALSE}
+BV_diversity <- bootstrap_hotspot_diversity("L508074", analysis_data.95, nboot = 1000, plot = T)
+
+BV_diversity$total <- tail(BV_diversity$mean, n=1)
+BV_diversity$cumpercent.observed <- 
+  (BV_diversity$mean/BV_diversity$total)*100
+
+
+# this dataframe represents the minimum number of checklists needed
+# to reach 70% of the estimated species richness at a particular site
+seventy_threshold <- data.frame(BV_diversity%>%
+                                  filter(cumpercent.observed >=70)%>%
+                                  slice(which.min(cumpercent.observed)))[c(1)]
+seventy_threshold$threshold <- '70%'
+
+# same as above, but for 80% threshold
+eighty_threshold <- data.frame(BV_diversity%>%
+                                 filter(cumpercent.observed >=80)%>%
+                                 slice(which.min(cumpercent.observed)))[c(1)]
+eighty_threshold$threshold <- '80%'
+
+# same as above, but for 90% threshold
+ninety_threshold <- data.frame(BV_diversity%>%
+                                 filter(cumpercent.observed >=90)%>%
+                                 slice(which.min(cumpercent.observed)))[c(1)]
+ninety_threshold$threshold <- '90%'
+
+# combine the three dataframes created above
+SPECIES_DIVERSITY_THRESHOLDS.95 <- rbind(seventy_threshold, eighty_threshold, ninety_threshold)
+
+head(SPECIES_DIVERSITY_THRESHOLDS.95)
+
+```
+
+
+
+
+
+
+
+
