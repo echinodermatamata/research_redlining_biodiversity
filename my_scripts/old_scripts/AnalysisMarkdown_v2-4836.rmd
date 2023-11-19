@@ -1,0 +1,162 @@
+---
+title: "GSRM wildfire and bird species diversity and richness"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE, fig.width = 6, fig.height = 4)
+```
+```{r}
+# Load all libraries that will be used during analysis
+library(readr)
+library(tidyverse)
+library(vegan)
+library(stringr)
+library(ggplot2)
+library(FSA)
+library(neonUtilities)
+
+#download data directly from NEON.  I have commented out the zipsByProduct and stackByTable functions for knitting.
+#make sure you have a folder called "bird_data_GRSM" in your working directory
+#zipsByProduct(dpID= 'DP1.10003.001', 
+#              site=c("GRSM"), 
+#             startdate = "2016-05", enddate = "2018-07",
+#             savepath = 'bird_data_GRSM', check.size = T)
+#stackByTable('bird_data_GRSM/filesToStack10003', folder=T)
+
+dat<-read.csv("bird_data_GRSM/filesToStack10003/stackedFiles/brd_countdata.csv")
+
+########################################
+# DATA MANIPULATION
+########################################
+# Then add a column for year from startDate
+dat$Year <- str_sub(dat$startDate, 1, 4)
+
+# Filter plotID values to include only plots that were sampled  before and after the fire
+brd_dat <- filter(dat, plotID %in% c("GRSM_001","GRSM_002","GRSM_003","GRSM_004",
+  "GRSM_006","GRSM_007","GRSM_010","GRSM_013","GRSM_015", "GRSM_020"))
+
+# Convert plotID and taxonID to factors
+brd_dat$plotID <- as.factor(brd_dat$plotID)
+brd_dat$taxonID <- as.factor(brd_dat$taxonID)
+
+# Remove columns where targetTaxaPresent = N 
+# No data associated with them
+brd_dat <- filter (brd_dat, targetTaxaPresent=="Y")
+
+####################################
+# CREATE DATA INPUT FOR VEGAN
+####################################
+
+# First filter by year to get the pre- and post-burn datasets separate
+bird_16 <- filter(brd_dat, Year==2016)
+bird_17 <- filter(brd_dat, Year==2017)
+bird_18 <- filter(brd_dat, Year==2018)
+
+# Then create a matrix of plotID by species using the piping function (%>%) 
+# to carry out multiple steps at a time using the date in the step before
+
+# Number of each species detected per plot in 2016
+brd_matrix_16 <- bird_16 %>% group_by(plotID, taxonID) %>%
+  summarise(count=n()) %>%
+  spread(taxonID,count) 
+
+# Convert NAs to 0
+brd_matrix_16[is.na(brd_matrix_16)] <- 0 
+
+# Vegan package does not like first column of plotID, so get rid of it!
+brd_matrix_16 <- brd_matrix_16[,-1] 
+
+# Look at it - does it look ok?
+brd_matrix_16 
+
+# Repeat previous steps for 2017 and 2018 data
+brd_matrix_17 <- bird_17 %>% group_by(plotID, taxonID) %>%
+  summarise(count=n()) %>%
+  spread(taxonID,count)
+brd_matrix_17[is.na(brd_matrix_17)] <- 0 
+brd_matrix_17 <- brd_matrix_17[,-1]
+brd_matrix_17
+
+brd_matrix_18 <- bird_18 %>% group_by(plotID, taxonID) %>%
+  summarise(count=n()) %>%
+  spread(taxonID,count)
+brd_matrix_18[is.na(brd_matrix_18)] <- 0 
+brd_matrix_18 <- brd_matrix_18[,-1]  
+brd_matrix_18 
+
+
+# Now we are ready to calculate some diversity indices for each plot
+# http://cc.oulu.fi/~jarioksa/softhelp/vegan/html/diversity.html
+
+#Calculate shannon diversity and richness for each plot in each year
+shd_16 <- diversity(brd_matrix_16, index = "shannon", MARGIN = 1, base = exp(1))
+shd_17 <- diversity(brd_matrix_17, index = "shannon", MARGIN = 1, base = exp(1))
+shd_18 <- diversity(brd_matrix_18, index = "shannon", MARGIN = 1, base = exp(1))
+
+rich_16 <- specnumber(brd_matrix_16, MARGIN = 1)
+rich_17 <- specnumber(brd_matrix_17, MARGIN = 1)
+rich_18 <- specnumber(brd_matrix_18, MARGIN = 1)
+
+####################################
+# Create dataset for running ANOVA to test hypotheses about 
+# changes in richness or diversity pre- and post-fire
+###################################
+
+# Create a new dataframe for each year (x_16 and x_17) with the above vectors from vegan 
+# and a few more created below.  Make the column names the same in both data frames so 
+# we can combine them
+plotID <- c("GRSM_001","GRSM_002","GRSM_003","GRSM_004","GRSM_006","GRSM_007",
+            "GRSM_010","GRSM_013","GRSM_015", "GRSM_020")
+burn <- c("y","n","y","n","n","y","n","n","n","n")
+year <- rep(2016, 10)
+year2 <- rep(2017, 10)
+year3 <- rep(2018, 10)
+x_16 <- data.frame(plotID, year, burn, shd_16, rich_16)
+#make the column names the same in both so we can combine
+colnames(x_16)<- c("plotID","year","burn","shd", "rich") 
+x_17 <- data.frame(plotID, year2, burn, shd_17, rich_17)
+colnames(x_17)<- c("plotID","year", "burn","shd", "rich")
+x_18 <- data.frame(plotID, year3, burn, shd_18, rich_18)
+colnames(x_18)<- c("plotID","year", "burn","shd", "rich")
+
+#combine x_16 and x_17 and x_18 into one dataframe and make year a factor
+x <- bind_rows(x_16, x_17, x_18)  
+x$year <- as.factor(x$year) 
+
+# Run ANOVA to see if treatment (burn), year, or an interaction of burn and year affect 
+# richness and shannon diversity
+fit_rich <- aov(rich ~ burn*year, x)
+summary(fit_rich)
+```
+\newpage
+
+```{r}
+fit_shd <- aov(shd ~ burn*year, x)
+summary(fit_shd)
+
+#to calculate Standard Deviation of estimates
+rich_means <- Summarize(rich ~ burn + year, data=x)
+diversity_means <- Summarize(shd ~ burn + year, data=x)
+
+```
+\vskip 1cm
+```{r}
+# Plot the data to visualize differences
+ggplot(rich_means, aes(x=burn, y=mean, fill=year))+
+  geom_bar(stat="identity", position=position_dodge()) +
+  geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), width=0.2, position=position_dodge(0.9))+
+  xlab("Burn") +
+  ylab("Bird Spp Richness")+
+  theme_classic()
+```
+\newpage
+```{r}
+ggplot(diversity_means, aes(x=burn, y=mean, fill=year))+
+  geom_bar(stat="identity", position=position_dodge()) +
+  geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), width=0.2, position=position_dodge(0.9))+
+  xlab("Burn") +
+  ylab("Bird Spp Diversity")+
+  theme_classic()
+```
+
