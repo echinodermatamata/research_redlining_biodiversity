@@ -37,31 +37,31 @@ ggplot() +
   theme_minimal()
 
 
-summary(merged_data)
+summary(bird_red_census)
 
 
 #Cleaning the Data
 # Remove NAs
-cleaned_df <- merged_data[!is.na(merged_data$percent_in_poverty) & !is.na(merged_data$proportion_in_poverty) & !is.na(merged_data$Species_Richness) & !is.na(merged_data$Species_Diversity) & !is.na(merged_data$Species_Richness), ]
+#cleaned_df <- merged_data[!is.na(merged_data$percent_in_poverty) & !is.na(merged_data$proportion_in_poverty) & !is.na(merged_data$Species_Richness) & !is.na(merged_data$Species_Diversity) & !is.na(merged_data$Species_Richness), ]
 
 #If you have character (chr) columns that you want to convert to numeric (num) in a data frame, you can use the mutate function from the dplyr package. Here's an example:
 
 # you want to convert the column to to numeric
 
 
-cleaned_df <- cleaned_df %>%
-  mutate(ResultMeasureValue = as.numeric(ResultMeasureValue))
+#cleaned_df <- cleaned_df %>%
+#  mutate(ResultMeasureValue = as.numeric(ResultMeasureValue))
 
 
 
 
 
-summary(cleaned_df$ResultMeasureValue)
+#summary(cleaned_df$ResultMeasureValue)
 
 # basic scatterplot
-ggplot(cleaned_df, aes(x = percent_in_poverty, y = Species_Richness)) + 
-  geom_point() +
-  geom_smooth(method = "lm", se = FALSE) +  # Fit a linear regression line
+ggplot(bird_red_census, aes(x = holc_grade, y = Species_Richness)) + 
+  geom_boxplot() +
+  # Fit a linear regression line
   labs(
     title = "Species Richness by Percent Poverty in Census Tract ",
     x = "Percent in Poverty",
@@ -69,7 +69,11 @@ ggplot(cleaned_df, aes(x = percent_in_poverty, y = Species_Richness)) +
   ) 
 
 # If you want to extract statistics, you can use the lm() function
-model <- lm(Species_Richness ~ percent_in_poverty, data = cleaned_df)
+model2 <- aov(Species_Richness ~ holc_grade, data = bird_red_census)
 
 # Print the summary of the linear regression model
-summary(model)
+summary(model2)
+
+tukey_results <- TukeyHSD(model2)
+
+tukey_results
